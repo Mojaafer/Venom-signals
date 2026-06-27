@@ -1,0 +1,320 @@
+//@version=5
+// ============================================================================
+//  ICT VENOM MODEL 2025  —  Buy / Sell Signals with Entry, SL & TP
+//  Based on Michael Huddleston's (Inner Circle Trader) 2025 Venom Model
+//
+//  ── MODEL FLOW ──────────────────────────────────────────────────────────
+//   1. ACCUMULATION  →  90-minute window builds a range (def. 08:00–09:30 NY)
+//   2. MANIPULATION  →  after the regular open (09:30 NY) price sweeps the
+//                       range LOW (bullish day) or range HIGH (bearish day)
+//   3. The sweep leg leaves a Fair Value Gap (FVG)
+//   4. A sharp reversal leaves an opposing FVG  →  together = BPR
+//                       (Balanced Price Range)
+//   5. MSS / CISD confirms the structural reversal
+//   6. DISTRIBUTION →  enter on retracement into the BPR / FVG (PD array)
+//   7. Stop loss  =  10–20 ticks beyond the swept extreme
+//   8. TP1 = opposite extreme of the 90-min range  |  TP2 = 2R / prior day H-L
+//
+//  Designed for US index futures (NQ / ES / YM) but works on any intraday
+//  chart. Not financial advice — educational tool only.
+// ============================================================================
+indicator("ICT Venom Model 2025 — Buy/Sell Signals", shorttitle="ICT Venom",
+     overlay=true, max_lines_count=200, max_boxes_count=200,
+     max_labels_count=200, max_bars_back=500)
+
+// ───────────────────────────────── INPUTS ──────────────────────────────────
+gT = "①  Time Window (90-min Accumulation)"
+winSess   = input.session("0800-0930", "Accumulation window (NY local)", group=gT,
+              tooltip="Default 08:00–09:30 NY. Alternate Venom windows: 0130-0300 or 1200-1330 (NY local).")
+tz        = input.string("America/New_York", "Timezone", group=gT,
+              options=["America/New_York","America/Chicago","America/Los_Angeles","Europe/London","UTC","Asia/Tokyo","Australia/Sydney"])
+tradeSess = input.session("0930-2400", "Trade window (after open)", group=gT,
+              tooltip="Signals only fire AFTER the regular open. Default 09:30 NY onward.")
+
+gC = "②  Sweep & Confirmation"
+useBPRonly = input.bool(false, "Entry on BPR only (earlier / riskier)", group=gC,
+              tooltip="ON = signal fires as soon as the reversal FVG (BPR) forms.\nOFF = wait for MSS and/or CISD confirmation (recommended by ICT).")
+reqMSS     = input.bool(true,  "Require MSS confirmation", group=gC)
+reqCISD    = input.bool(true,  "Require CISD (engulfing) confirmation", group=gC)
+fvgMinSize = input.float(0.0,  "Minimum FVG size (points, 0 = any)", group=gC,
+              tooltip="Filter out tiny gaps. Set to e.g. 2 for NQ to ignore noise.")
+maxBars    = input.int(40, "Max bars to wait for confirmation", minval=5, group=gC,
+              tooltip="If no confirmation within this many bars the setup is invalidated for the day.")
+
+gR = "③  Stop Loss & Targets"
+slTicks   = input.int(20,  "Stop-loss buffer (ticks)", minval=1, group=gR,
+             tooltip="ICT recommends 10–20 ticks beyond the swept extreme.")
+tickSz    = input.float(0.0, "Tick size in points (0 = use syminfo.mintick)", group=gR,
+             tooltip="NQ=0.25, ES=0.25, YM=1.0. Leave 0 for forex/auto.")
+tp1Range  = input.bool(true, "TP1 = opposite extreme of 90-min range", group=gR)
+useRR     = input.bool(true, "Use fixed R:R for TP2", group=gR)
+rrMult    = input.float(2.0, "TP2  R:R multiple", minval=0.5, group=gR,
+             tooltip="Venom scalp target is commonly 2R.")
+usePDE    = input.bool(false, "TP2 = prior-day opposite extreme (else TP2=TP1)", group=gR)
+
+gV = "④  Visuals"
+showRng   = input.bool(true, "Show 90-min range box", group=gV)
+showSw    = input.bool(true, "Mark sweep extreme", group=gV)
+showFB    = input.bool(true, "Show FVG / BPR boxes", group=gV)
+showLV    = input.bool(true, "Show Entry / SL / TP lines", group=gV)
+cBull     = input.color(color.new(color.lime, 0),  "Bullish", group=gV)
+cBear     = input.color(color.new(color.red, 0),   "Bearish", group=gV)
+cRange    = input.color(color.new(color.gray, 80), "Range",  group=gV)
+cFVG      = input.color(color.new(color.orange, 80),"FVG/BPR",group=gV)
+
+gA = "⑤  Alerts"
+alOn      = input.bool(true, "Enable alert conditions", group=gA)
+
+// ───────────────────────────────── HELPERS ─────────────────────────────────
+tk    = tickSz > 0 ? tickSz : syminfo.mintick
+inWin = not na(time(timeframe.period, winSess,   tz))
+inTrd = not na(time(timeframe.period, tradeSess, tz))
+
+// Fair Value Gap (3-candle pattern)
+//  bullish FVG: current low  > high of 2 bars ago   → gap [high[2] .. low]
+//  bearish FVG: current high < low  of 2 bars ago   → gap [high .. low[2]]
+fvgGapBull = low > high[2]
+fvgGapBear = high < low[2]
+bullFVG = fvgGapBull and (low - high[2])  >= fvgMinSize
+bearFVG = fvgGapBear and (low[2] - high)  >= fvgMinSize
+
+// CISD — Change In State of Delivery (engulfing reversal candle)
+bullCISD = close[1] < open[1] and close > open and close >= high[1] and open <= low[1]
+bearCISD = close[1] > open[1] and close < open and close <= low[1] and open >= high[1]
+
+// Prior-day high/low for extended TP2 target
+prevDayHigh = request.security(syminfo.tickerid, "D", high[1])
+prevDayLow  = request.security(syminfo.tickerid, "D", low[1])
+
+// ───────────────────────────────── STATE ───────────────────────────────────
+//  st:  0 idle | 1 building range | 2 await sweep | 3 swept/await confirm | 4 done
+var int   st          = 0
+var float rHigh       = na
+var float rLow        = na
+var int   sweepDir    = 0       // 1 = bullish (swept low), -1 = bearish (swept high)
+var float sweepExt    = na      // swept extreme price
+var int   barsSince   = 0
+var float sweepFVGtop = na      // FVG left by the sweep leg
+var float sweepFVGbot = na
+var bool  sweepFVGset = false
+var float revFVGtop   = na      // reversal FVG (the BPR entry PD-array)
+var float revFVGbot   = na
+var bool  revFVGset   = false
+var bool  mssOK       = false
+var bool  cisdOK      = false
+var float mssRef      = na      // structure level to break for MSS
+
+var box   rngBox      = na
+var box   swpFVGbox   = na
+var box   revFVGbox   = na
+var line  sweepLn     = na
+var label sweepLbl    = na
+var line  entryLn     = na
+var line  slLn        = na
+var line  tp1Ln       = na
+var line  tp2Ln       = na
+var label sigLbl      = na
+
+// ── new accumulation window → daily reset ──
+newWin = inWin and not inWin[1]
+if newWin
+    st          := 1
+    rHigh       := high
+    rLow        := low
+    sweepDir    := 0
+    sweepExt    := na
+    barsSince   := 0
+    sweepFVGtop := na
+    sweepFVGbot := na
+    sweepFVGset := false
+    revFVGtop   := na
+    revFVGbot   := na
+    revFVGset   := false
+    mssOK       := false
+    cisdOK      := false
+    mssRef      := na
+    // clear previous day's signal artwork
+    if not na(rngBox)
+        box.delete(rngBox)
+    if not na(swpFVGbox)
+        box.delete(swpFVGbox)
+    if not na(revFVGbox)
+        box.delete(revFVGbox)
+    if not na(sweepLn)
+        line.delete(sweepLn)
+    if not na(sweepLbl)
+        label.delete(sweepLbl)
+    if not na(entryLn)
+        line.delete(entryLn)
+    if not na(slLn)
+        line.delete(slLn)
+    if not na(tp1Ln)
+        line.delete(tp1Ln)
+    if not na(tp2Ln)
+        line.delete(tp2Ln)
+    if not na(sigLbl)
+        label.delete(sigLbl)
+    if showRng
+        rngBox := box.new(bar_index, high, bar_index, low, border_color=cRange,
+             bgcolor=cRange, text="90-min range", text_size=size.tiny, text_color=color.gray)
+
+// ── expand range during the window ──
+if inWin and st == 1
+    rHigh := math.max(rHigh, high)
+    rLow  := math.min(rLow,  low)
+    if showRng and not na(rngBox)
+        box.set_top(rngBox, rHigh)
+        box.set_bottom(rngBox, rLow)
+        box.set_right(rngBox, bar_index)
+
+// ── window ends → lock range, await sweep ──
+endWin = not inWin and inWin[1]
+if endWin and st == 1
+    st := 2
+    if showRng and not na(rngBox)
+        box.set_right(rngBox, bar_index)
+
+// ── SWEEP detection (state 2, inside trade window) ──
+if st == 2 and inTrd
+    if low < rLow                                   // bullish: grab sell-side liquidity
+        sweepDir := 1
+        sweepExt := low
+        mssRef   := high                             // sweep-candle high → MSS level to reclaim
+        barsSince:= 0
+        st       := 3
+        if showSw
+            sweepLn  := line.new(bar_index, low,  bar_index+8, low,  color=cBull, style=line.style_dotted)
+            sweepLbl := label.new(bar_index, low,  "Bull sweep", style=label.style_label_up,
+                          color=color.new(cBull,60), textcolor=color.white, size=size.tiny)
+    else if high > rHigh                            // bearish: grab buy-side liquidity
+        sweepDir := -1
+        sweepExt := high
+        mssRef   := low                              // sweep-candle low → MSS level to break
+        barsSince:= 0
+        st       := 3
+        if showSw
+            sweepLn  := line.new(bar_index, high, bar_index+8, high, color=cBear, style=line.style_dotted)
+            sweepLbl := label.new(bar_index, high, "Bear sweep", style=label.style_label_down,
+                          color=color.new(cBear,60), textcolor=color.white, size=size.tiny)
+
+// ── CONFIRMATION tracking (state 3) ──
+if st == 3
+    barsSince += 1
+    // sweep may extend a few bars before reversing → keep tracking the extreme
+    // and the opposite extreme of the sweep leg (the MSS level to reclaim)
+    if sweepDir == 1
+        sweepExt := math.min(sweepExt, low)
+        mssRef   := math.max(mssRef, high)
+    else if sweepDir == -1
+        sweepExt := math.max(sweepExt, high)
+        mssRef   := math.min(mssRef, low)
+
+    // sweep-leg FVG (same direction as the sweep)
+    if sweepDir == 1 and bearFVG and not sweepFVGset
+        sweepFVGbot := high
+        sweepFVGtop := low[2]
+        sweepFVGset := true
+        if showFB
+            swpFVGbox := box.new(bar_index-2, sweepFVGtop, bar_index+15, sweepFVGbot,
+                 border_color=color.new(cFVG,50), bgcolor=color.new(cFVG,85), text="sweep FVG", text_size=size.tiny)
+    if sweepDir == -1 and bullFVG and not sweepFVGset
+        sweepFVGbot := high[2]
+        sweepFVGtop := low
+        sweepFVGset := true
+        if showFB
+            swpFVGbox := box.new(bar_index-2, sweepFVGtop, bar_index+15, sweepFVGbot,
+                 border_color=color.new(cFVG,50), bgcolor=color.new(cFVG,85), text="sweep FVG", text_size=size.tiny)
+
+    // reversal FVG (opposite direction → BPR component + entry PD-array)
+    if sweepDir == 1 and bullFVG and not revFVGset
+        revFVGbot := high[2]
+        revFVGtop := low
+        revFVGset := true
+        if showFB
+            revFVGbox := box.new(bar_index-2, revFVGtop, bar_index+25, revFVGbot,
+                 border_color=cFVG, bgcolor=color.new(cFVG,70), text="BPR entry FVG", text_size=size.tiny)
+    if sweepDir == -1 and bearFVG and not revFVGset
+        revFVGbot := high
+        revFVGtop := low[2]
+        revFVGset := true
+        if showFB
+            revFVGbox := box.new(bar_index-2, revFVGtop, bar_index+25, revFVGbot,
+                 border_color=cFVG, bgcolor=color.new(cFVG,70), text="BPR entry FVG", text_size=size.tiny)
+
+    // CISD (engulfing reversal)
+    if sweepDir == 1 and bullCISD
+        cisdOK := true
+    if sweepDir == -1 and bearCISD
+        cisdOK := true
+
+    // MSS — reclaim the pre-sweep minor structure
+    if sweepDir == 1  and not na(mssRef) and close > mssRef
+        mssOK := true
+    if sweepDir == -1 and not na(mssRef) and close < mssRef
+        mssOK := true
+
+    // invalidate if no confirmation in time
+    if barsSince > maxBars
+        st := 4
+
+// ── SIGNAL evaluation (st still 3 → fire and lock to 4) ──
+confirm  = (not reqMSS  or mssOK)  and (not reqCISD or cisdOK)
+firedBull = st == 3 and sweepDir ==  1 and revFVGset and (useBPRonly or confirm)
+firedBear = st == 3 and sweepDir == -1 and revFVGset and (useBPRonly or confirm)
+
+// ── act on BUY signal ──
+if firedBull
+    st := 4
+    float entry = (revFVGbot + revFVGtop) / 2.0
+    float sl    = sweepExt - slTicks * tk
+    float risk  = math.max(entry - sl, tk)
+    float tp1   = tp1Range ? rHigh : entry + rrMult * risk
+    float tp2   = useRR ? entry + rrMult * risk : (usePDE ? prevDayHigh : tp1)
+    if showLV
+        entryLn := line.new(bar_index, entry, bar_index, entry, extend=extend.right, color=cBull, style=line.style_solid,  width=2)
+        slLn    := line.new(bar_index, sl,    bar_index, sl,    extend=extend.right, color=color.red, style=line.style_dashed)
+        tp1Ln   := line.new(bar_index, tp1,   bar_index, tp1,   extend=extend.right, color=color.new(color.lime,40), style=line.style_dotted)
+        tp2Ln   := line.new(bar_index, tp2,   bar_index, tp2,   extend=extend.right, color=color.new(color.lime,20), style=line.style_dotted, width=2)
+    sigLbl := label.new(bar_index, low, "BUY ▲\nEntry " + str.tostring(entry, format.mintick) +
+         "\nSL " + str.tostring(sl, format.mintick) + "\nTP1 " + str.tostring(tp1, format.mintick) +
+         "\nTP2 " + str.tostring(tp2, format.mintick), style=label.style_label_up,
+         color=color.new(cBull,30), textcolor=color.white, size=size.small)
+
+// ── act on SELL signal ──
+if firedBear
+    st := 4
+    float entry = (revFVGbot + revFVGtop) / 2.0
+    float sl    = sweepExt + slTicks * tk
+    float risk  = math.max(sl - entry, tk)
+    float tp1   = tp1Range ? rLow : entry - rrMult * risk
+    float tp2   = useRR ? entry - rrMult * risk : (usePDE ? prevDayLow : tp1)
+    if showLV
+        entryLn := line.new(bar_index, entry, bar_index, entry, extend=extend.right, color=cBear, style=line.style_solid,  width=2)
+        slLn    := line.new(bar_index, sl,    bar_index, sl,    extend=extend.right, color=color.red, style=line.style_dashed)
+        tp1Ln   := line.new(bar_index, tp1,   bar_index, tp1,   extend=extend.right, color=color.new(color.red,40), style=line.style_dotted)
+        tp2Ln   := line.new(bar_index, tp2,   bar_index, tp2,   extend=extend.right, color=color.new(color.red,20), style=line.style_dotted, width=2)
+    sigLbl := label.new(bar_index, high, "SELL ▼\nEntry " + str.tostring(entry, format.mintick) +
+         "\nSL " + str.tostring(sl, format.mintick) + "\nTP1 " + str.tostring(tp1, format.mintick) +
+         "\nTP2 " + str.tostring(tp2, format.mintick), style=label.style_label_down,
+         color=color.new(cBear,30), textcolor=color.white, size=size.small)
+
+// ───────────────────────────────── PLOTS & ALERTS ───────────────────────────
+plotshape(firedBull, "BUY",  shape.labelup,   location.belowbar, color=cBull, text="BUY",  textcolor=color.white, size=size.small)
+plotshape(firedBear, "SELL", shape.labeldown, location.abovebar, color=cBear, text="SELL", textcolor=color.white, size=size.small)
+
+// status line so the trader can see the live setup state
+var table stat = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black,70), border_width=1)
+if barstate.islast
+    table.cell(stat, 0, 0, "Venom state", text_color=color.gray, text_size=size.tiny)
+    table.cell(stat, 1, 0, st == 1 ? "Building range" : st == 2 ? "Awaiting sweep" : st == 3 ? "Swept — confirming" : st == 4 ? "Done / invalidated" : "Idle", text_color=color.white, text_size=size.tiny)
+    table.cell(stat, 0, 1, "Range H/L", text_color=color.gray, text_size=size.tiny)
+    table.cell(stat, 1, 1, str.tostring(rHigh, format.mintick) + " / " + str.tostring(rLow, format.mintick), text_color=color.white, text_size=size.tiny)
+    table.cell(stat, 0, 2, "Sweep", text_color=color.gray, text_size=size.tiny)
+    table.cell(stat, 1, 2, sweepDir == 1 ? "Bull (low swept)" : sweepDir == -1 ? "Bear (high swept)" : "—", text_color=sweepDir==1?cBull:sweepDir==-1?cBear:color.white, text_size=size.tiny)
+    table.cell(stat, 0, 3, "Confirm", text_color=color.gray, text_size=size.tiny)
+    table.cell(stat, 1, 3, "FVG:" + (revFVGset?"✓":"✗") + " MSS:" + (mssOK?"✓":"✗") + " CISD:" + (cisdOK?"✓":"✗"), text_color=color.white, text_size=size.tiny)
+
+alertcondition(firedBull and alOn, "Venom BUY",  "ICT Venom BUY signal — see chart for Entry / SL / TP1 / TP2")
+alertcondition(firedBear and alOn, "Venom SELL", "ICT Venom SELL signal — see chart for Entry / SL / TP1 / TP2")
+if (firedBull or firedBear) and alOn
+    alert((firedBull ? "BUY" : "SELL") + " ICT Venom setup on " + syminfo.ticker + " (" + timeframe.period + ")", alert.freq_once_per_bar_close)
